@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from .gaussian_diffusion import GaussianDiffusion
-from .k_diffusion import karras_sample
+from .k_diffusion import karras_sample, karras_sds
 
 DEFAULT_KARRAS_STEPS = 64
 DEFAULT_KARRAS_SIGMA_MIN = 1e-3
@@ -88,3 +88,68 @@ def sample_latents(
             )
 
     return samples
+
+
+def latent_sds(
+    *,
+    latent: torch.Tensor,
+    batch_size: int,
+    model: nn.Module,
+    diffusion: GaussianDiffusion,
+    model_kwargs: Dict[str, Any],
+    guidance_scale: float,
+    clip_denoised: bool,
+    use_fp16: bool,
+    use_karras: bool,
+    karras_steps: int,
+    sigma_min: float,
+    sigma_max: float,
+    s_churn: float,
+    device: Optional[torch.device] = None,
+    progress: bool = False,
+) -> torch.Tensor:
+    batch_size = 1
+
+    if device is None:
+        device = next(model.parameters()).device
+
+    if hasattr(model, "cached_model_kwargs"):
+        model_kwargs = model.cached_model_kwargs(batch_size, model_kwargs)
+    if guidance_scale != 1.0 and guidance_scale != 0.0:
+        for k, v in model_kwargs.copy().items():
+            model_kwargs[k] = torch.cat([v, torch.zeros_like(v)], dim=0)
+
+    sample_shape = (batch_size, model.d_latent)
+    with torch.autocast(device_type=device.type, enabled=use_fp16):
+        if use_karras:
+            samples = karras_sds(
+                latent=latent,
+                diffusion=diffusion,
+                model=model,
+                shape=sample_shape,
+                steps=karras_steps,
+                clip_denoised=clip_denoised,
+                model_kwargs=model_kwargs,
+                device=device,
+                sigma_min=sigma_min,
+                sigma_max=sigma_max,
+                s_churn=s_churn,
+                guidance_scale=guidance_scale,
+                progress=progress,
+            )
+        else:
+            internal_batch_size = batch_size
+            if guidance_scale != 1.0:
+                model = uncond_guide_model(model, guidance_scale)
+                internal_batch_size *= 2
+            samples = diffusion.p_sample_loop(
+                model,
+                shape=(internal_batch_size, *sample_shape[1:]),
+                model_kwargs=model_kwargs,
+                device=device,
+                clip_denoised=clip_denoised,
+                progress=progress,
+            )
+
+    return samples
+

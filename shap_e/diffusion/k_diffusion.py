@@ -191,6 +191,90 @@ def karras_sample_progressive(
             yield obj
 
 
+def karras_sds(*args, **kwargs):
+    last = None
+    for x in karras_sds_progressive(*args, **kwargs):
+        last = x["x"]
+    return last
+
+
+def karras_sds_progressive(
+    latent,
+    diffusion,
+    model,
+    shape,
+    steps,
+    clip_denoised=True,
+    progress=False,
+    model_kwargs=None,
+    device=None,
+    sigma_min=0.002,
+    sigma_max=80,  # higher for highres?
+    rho=7.0,
+    sampler="heun",
+    s_churn=0.0,
+    s_tmin=0.0,
+    s_tmax=float("inf"),
+    s_noise=1.0,
+    guidance_scale=0.0,
+):
+    sigmas = get_sigmas_karras(steps, sigma_min, sigma_max, rho, device=device)
+    x_T = latent + th.randn(*shape, device=device) * sigma_max
+    sample_fn = {"heun": sample_heun, "dpm": sample_dpm, "ancestral": sample_euler_ancestral}[
+        sampler
+    ]
+
+    if sampler != "ancestral":
+        sampler_args = dict(s_churn=s_churn, s_tmin=s_tmin, s_tmax=s_tmax, s_noise=s_noise)
+    else:
+        sampler_args = {}
+
+    if isinstance(diffusion, KarrasDenoiser):
+
+        def denoiser(x_t, sigma):
+            _, denoised = diffusion.denoise(model, x_t, sigma, **model_kwargs)
+            if clip_denoised:
+                denoised = denoised.clamp(-1, 1)
+            return denoised
+
+    elif isinstance(diffusion, GaussianDiffusion):
+        model = GaussianToKarrasDenoiser(model, diffusion)
+
+        def denoiser(x_t, sigma):
+            _, denoised = model.denoise(
+                x_t, sigma, clip_denoised=clip_denoised, model_kwargs=model_kwargs
+            )
+            return denoised
+
+    else:
+        raise NotImplementedError
+
+    if guidance_scale != 0 and guidance_scale != 1:
+
+        def guided_denoiser(x_t, sigma):
+            x_t = th.cat([x_t, x_t], dim=0)
+            sigma = th.cat([sigma, sigma], dim=0)
+            x_0 = denoiser(x_t, sigma)
+            cond_x_0, uncond_x_0 = th.split(x_0, len(x_0) // 2, dim=0)
+            x_0 = uncond_x_0 + guidance_scale * (cond_x_0 - uncond_x_0)
+            return x_0
+
+    else:
+        guided_denoiser = denoiser
+
+    for obj in sample_fn(
+        guided_denoiser,
+        x_T,
+        sigmas,
+        progress=progress,
+        **sampler_args,
+    ):
+        if isinstance(diffusion, GaussianDiffusion):
+            yield diffusion.unscale_out_dict(obj)
+        else:
+            yield obj
+
+
 def get_sigmas_karras(n, sigma_min, sigma_max, rho=7.0, device="cpu"):
     """Constructs the noise schedule of Karras et al. (2022)."""
     ramp = th.linspace(0, 1, n)
